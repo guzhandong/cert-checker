@@ -1,0 +1,16 @@
+# cert-checker crontab 示例
+#
+# 使用方法：
+#   crontab -e
+#   把下面任意一行粘贴进去（去掉行首 #），保存退出
+#
+# 路径说明：本项目假设部署在 /opt/cert-checker，如放在其他目录请自行替换
+
+# 每天早上 09:00 检测一次，日志追加到 cert-checker.log
+0 9 * * * cd /opt/cert-checker && /usr/bin/node check.js >> cert-checker.log 2>&1
+
+# 每天早上 09:00 和下午 18:00 各检测一次
+# 0 9,18 * * * cd /opt/cert-checker && /usr/bin/node check.js >> cert-checker.log 2>&1
+
+# 每小时检测一次（证书快到期时能更早发现）
+# 0 * * * * cd /opt/cert-checker && /usr/bin/node check.js >> cert-checker.log 2>&1

@@ -1,0 +1,13 @@
+# cert-checker 单次运行单元（检测一轮后退出，配合 cert-checker.timer 每天定时触发）
+[Unit]
+Description=HTTPS certificate expiry monitor (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/cert-checker
+ExecStart=/usr/bin/node check.js
+# 输出写入 journal，用 journalctl -u cert-checker 查看
+StandardOutput=journal
+StandardError=journal

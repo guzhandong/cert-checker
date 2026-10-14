@@ -1,0 +1,11 @@
+# cert-checker 定时触发单元（配合 cert-checker.service 单次运行单元使用，每天 09:00 检测一次）
+[Unit]
+Description=Run cert-checker daily at 09:00
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+# 如果错过了触发时间（如服务器关机），开机后立即补跑一次
+Persistent=true
+
+[Install]
+WantedBy=timers.target

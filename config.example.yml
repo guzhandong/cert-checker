@@ -1,0 +1,90 @@
+# ============================================================
+# cert-checker 配置文件
+# 使用方法：cp config.example.yml config.yml 然后按需修改
+# ============================================================
+
+# 全局设置
+threshold: 30          # 提前多少天开始通知（全局默认，域名可单独覆盖）
+timeout: 10            # 连接超时时间（秒）
+
+# 要监控的域名列表（至少配一个）
+domains:
+  - host: www.baidu.com          # 域名（必填）
+    # port: 443                  # 端口（可选，默认 443；非标端口如 8443 时填写）
+    # threshold: 14              # 该域名的专属阈值（可选，覆盖全局 threshold）
+    remark: 示例域名              # 备注（可选，通知里会展示）
+    # notify: ops                 # 通知模板名（可选，走 templates 里对应的渠道组合；不填走下方 notify）
+
+  # 继续添加更多域名，直接复制上面的格式：
+  # - host: api.example.com
+  #   port: 8443
+  #   remark: API 网关
+  #   notify: boss               # 这个域名的告警发到「boss」模板的渠道
+
+# ============================================================
+# 域名注册到期检测（可选，与上面的证书检测完全独立）
+# 检测的是域名本身的有效期（续费时间），数据来自域名注册局（RDAP/WHOIS），
+# 阿里云 / 腾讯云 / 国外注册商的域名都能查。阈值、通知模板与证书检测分开设置。
+# ============================================================
+whois:
+  # threshold: 30            # 域名到期阈值（独立于证书的 threshold）
+  # timeout: 15              # 查询超时（秒，默认 15，whois 查询比证书慢）
+  domains:
+  #  - host: example.com     # 域名（必填，只填主域名，不带 www 和路径）
+  #    threshold: 14         # 专属阈值（可选）
+  #    remark: 主域名         # 备注（可选）
+  #    notify: ops           # 通知模板（可选，同证书检测的模板机制）
+
+# ============================================================
+# 默认通知渠道（域名没配 notify 模板时走这里）
+# 四个渠道都是可选的：配了哪个就发哪个，全部不配则只打印结果
+# ============================================================
+notify:
+
+  # ---- 邮箱通知（SMTP）----
+  # email:
+  #   smtp:
+  #     host: smtp.qq.com        # SMTP 服务器（QQ: smtp.qq.com / 163: smtp.163.com / 腾讯企业邮: smtp.exmail.qq.com）
+  #     port: 465                # 465 = SSL，587 = STARTTLS（国内邮箱一般用 465）
+  #     user: your@qq.com        # 发件邮箱账号
+  #     pass: abcdefghijklmnop   # SMTP 授权码（不是登录密码！在邮箱网页版设置里开启 SMTP 后生成）
+  #   from: your@qq.com          # 发件人（可选，默认同 user）
+  #   to:                        # 收件人列表（至少一个）
+  #     - admin@example.com
+
+  # ---- 飞书机器人 ----
+  # feishu:
+  #   webhook: https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx  # 群机器人 webhook 地址
+  #   secret: ''                 # 签名密钥（可选；机器人开启了"签名校验"才需要填）
+
+  # ---- 企业微信机器人 ----
+  # wecom:
+  #   webhook: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx
+
+  # ---- 钉钉机器人 ----
+  # dingtalk:
+  #   webhook: https://oapi.dingtalk.com/robot/send?access_token=xxxxxxxx
+  #   secret: SECxxxxxxxx        # 加签密钥（可选；机器人安全设置选了"加签"时必填）
+
+# ============================================================
+# 通知模板：给不同域名配不同的通知渠道组合（可选功能）
+# 在域名的 notify 字段里引用模板名即可，例如：
+#   - host: a.example.com
+#     notify: ops           # a 域名的告警 → 飞书
+#   - host: b.example.com
+#     notify: boss          # b 域名的告警 → 钉钉
+# 模板名用英文（如 ops、boss、team-a），不要用 email / feishu / wecom / dingtalk / all 这几个保留字
+# ============================================================
+templates:
+
+  # ops:                      # 模板名（自定义，用英文）
+  #   feishu:
+  #     webhook: https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx
+
+  # boss:
+  #   dingtalk:
+  #     webhook: https://oapi.dingtalk.com/robot/send?access_token=xxxxxxxx
+  #     secret: SECxxxxxxxx
+  #   email:                  # 一个模板里也可以配多个渠道，告警会同时发
+  #     smtp: { host: smtp.qq.com, port: 465, user: your@qq.com, pass: 授权码 }
+  #     to: [boss@example.com]

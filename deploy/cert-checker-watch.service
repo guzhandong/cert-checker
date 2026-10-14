@@ -1,0 +1,17 @@
+# cert-checker 常驻模式单元（--watch 每 3600 秒 = 1 小时检测一轮，与 timer 模式二选一）
+[Unit]
+Description=HTTPS certificate expiry monitor (watch mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cert-checker
+ExecStart=/usr/bin/node check.js --watch 3600
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

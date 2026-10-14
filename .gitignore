@@ -1,0 +1,11 @@
+# 本地私有配置（含 webhook 地址、SMTP 授权码等敏感信息）
+config.yml
+
+# 通知去重状态文件 / RDAP 缓存
+state.json
+rdap-bootstrap.json
+
+node_modules/
+package-lock.json
+*.log
+.DS_Store
