@@ -34,18 +34,26 @@ cert-checker — 轻量证书 / 域名到期监控
 用法:
   node check.js                          检测一轮后退出（配 cron / systemd timer 用）
   node check.js --watch 3600             常驻模式，每 3600 秒检测一轮
-  node check.js --test feishu            向指定渠道发测试消息（feishu / wecom / dingtalk / email / all）
-  node check.js --test ops               向指定通知模板的全部渠道发测试消息（参数为模板名）
+  node check.js --test feishu            向 default 分组的指定渠道发测试消息（feishu / wecom / dingtalk / email / all）
+  node check.js --test ops               向指定分组的全部渠道发测试消息（参数为分组名）
   node check.js --dry-run                只检测和打印，不发送通知
   node check.js --config /path/cfg.yml   指定配置文件路径
 
 配置（默认读取脚本同目录下的 config.yml，参考 config.example.yml）:
   domains        HTTPS 证书到期检测（TLS 握手取证书剩余天数）
   whois.domains  域名注册到期检测（注册局 RDAP/WHOIS，与注册商无关）
-  两套配置独立设置阈值；域名的 notify 字段引用 templates 实现分域名走不同通知渠道
+  两套配置独立设置阈值；通知渠道统一在 groups 里按分组配置，
+  域名用 notify 指定分组（可填多个，如 notify: [ops, boss]），不填走 default 分组
 `;
 
 // ---------- 配置加载 ----------
+/** 归一化域名的 notify 字段：不填 → ['default']；支持字符串或数组（同一域名推多个分组） */
+function resolveNotifyGroups(notify) {
+  const list = notify == null ? [] : Array.isArray(notify) ? notify : [notify];
+  const groups = [...new Set(list.filter(Boolean))];
+  return groups.length ? groups : ['default'];
+}
+
 function loadConfig(file) {
   if (!fs.existsSync(file)) {
     console.error(`✖ 配置文件不存在：${file}`);
@@ -57,20 +65,41 @@ function loadConfig(file) {
     console.error(`✖ 配置文件中没有域名，请编辑 ${file} 的 domains（证书）或 whois.domains（域名到期）部分`);
     process.exit(1);
   }
-  // 校验域名引用的通知模板都存在，避免告警静默丢失
-  const templates = cfg.templates || {};
+
+  // 兼容旧版写法（提示迁移）：templates → groups，顶层 notify → groups.default
+  const groups = { ...(cfg.templates || {}), ...(cfg.groups || {}) };
+  if (cfg.templates && cfg.groups) {
+    console.warn(C.yellow('⚠ templates 与 groups 同时存在，已按 groups 处理，请删除 templates 以免混淆'));
+  } else if (cfg.templates) {
+    console.warn(C.yellow('⚠ 检测到旧版 templates 写法，本次已按 groups 处理，请尽快改名为 groups'));
+  }
+  if (cfg.notify && Object.keys(cfg.notify).length) {
+    if (groups.default) {
+      console.warn(C.yellow('⚠ 顶层 notify 与 groups.default 同时存在，已忽略顶层 notify，请删除以免混淆'));
+    } else {
+      groups.default = cfg.notify;
+      console.warn(C.yellow('⚠ 检测到旧版顶层 notify 写法，本次按 default 分组处理，请尽快迁移到 groups.default'));
+    }
+  }
+  cfg.groups = groups;
+
+  // 校验分组名与域名引用的分组都存在，避免告警静默丢失
   const RESERVED = ['email', 'feishu', 'wecom', 'dingtalk', 'all'];
-  for (const name of Object.keys(templates)) {
+  for (const name of Object.keys(groups)) {
     if (RESERVED.includes(name)) {
-      console.error(`✖ 模板名「${name}」是保留字（${RESERVED.join(' / ')}），会导致 --test 无法区分渠道和模板，请改名`);
+      console.error(`✖ 分组名「${name}」是保留字（${RESERVED.join(' / ')}），会导致 --test 无法区分渠道和分组，请改名`);
       process.exit(1);
     }
   }
   for (const d of [...(cfg.domains || []), ...(cfg.whois?.domains || [])]) {
-    if (d.notify && !templates[d.notify]) {
-      console.error(`✖ 域名 ${d.host} 引用的通知模板「${d.notify}」未在 templates 中定义`);
-      console.error(`  已定义的模板：${Object.keys(templates).join('、') || '（无）'}`);
-      process.exit(1);
+    for (const g of resolveNotifyGroups(d.notify)) {
+      // default 分组允许不配置（发送阶段会提示未配渠道）；显式引用其他分组必须存在
+      if (g === 'default' && !groups.default) continue;
+      if (!groups[g]) {
+        console.error(`✖ 域名 ${d.host} 引用的通知分组「${g}」未在 groups 中定义`);
+        console.error(`  已定义的分组：${Object.keys(groups).join('、') || '（无）'}`);
+        process.exit(1);
+      }
     }
   }
   return cfg;
@@ -120,35 +149,47 @@ function printWhoisTable(rows, defaultThreshold) {
   console.log(C.dim('──'.repeat(30)));
 }
 
-/** 旧版 state key 无类型前缀（host:port），迁移为 cert: 前缀，避免升级当天重复通知 */
+/** state key 迁移：旧版无类型前缀（host:port）的补 cert: 前缀；分组功能前的 key 无「|分组」后缀，
+ *  删除避免残留死数据（升级当天会重新通知一次） */
 function migrateState(state) {
   for (const k of Object.keys(state)) {
     if (!k.startsWith('cert:') && !k.startsWith('domain:')) {
       state[`cert:${k}`] = state[k];
+      delete state[k];
+    } else if (!k.includes('|')) {
       delete state[k];
     }
   }
 }
 
 /**
- * 通用告警处理：判定 → 去重 → 按模板分组发送。
- * entries: [{ host, result, threshold, remark, notifyTpl, stateKey }]
+ * 通用告警处理：判定 → 按「域名 × 分组」去重 → 聚合发送。
+ * entries: [{ host, result, threshold, remark, notifyGroups, stateKey }]
+ * 同一域名配了多个分组时，每个分组各发一条；去重粒度也是域名 × 分组，
+ * 某个分组发送失败时下一轮只重试该分组，不会重复打扰已成功的分组。
  * 返回本轮是否存在告警（含被去重跳过的）。
  */
 async function processAlerts(cfg, args, state, entries, kind) {
-  const alerts = [];
+  const batches = new Map(); // 分组名 → 该分组待发送的条目
   let skippedToday = 0;
   for (const e of entries) {
     const r = e.result;
     const isAlert = !r.ok || r.daysLeft <= e.threshold;
-    if (shouldNotify(state, e.stateKey, { isAlert, daysLeft: r.ok ? r.daysLeft : null })) {
-      alerts.push({ ...r, remark: e.remark, threshold: e.threshold, notifyTpl: e.notifyTpl });
-    } else if (isAlert) {
-      skippedToday++;
+    const pending = e.notifyGroups.filter((g) =>
+      shouldNotify(state, `${e.stateKey}|${g}`, { isAlert, daysLeft: r.ok ? r.daysLeft : null })
+    );
+    if (!pending.length) {
+      if (isAlert) skippedToday++;
+      continue;
+    }
+    const item = { ...r, remark: e.remark, threshold: e.threshold, stateKey: e.stateKey };
+    for (const g of pending) {
+      if (!batches.has(g)) batches.set(g, []);
+      batches.get(g).push(item);
     }
   }
 
-  if (!alerts.length) {
+  if (!batches.size) {
     if (skippedToday) {
       console.log(C.yellow(`有 ${skippedToday} 个域名仍在告警状态，今天已通知过，跳过重复提醒。`));
     } else {
@@ -158,24 +199,20 @@ async function processAlerts(cfg, args, state, entries, kind) {
   }
 
   if (args.dryRun) {
-    console.log(C.yellow(`[dry-run] 以下 ${alerts.length} 个满足通知条件，已跳过发送：`));
-    for (const a of alerts) {
-      const tpl = a.notifyTpl ? ` → 模板「${a.notifyTpl}」` : '';
-      console.log(`  - ${a.host}${a.ok ? `（剩余 ${a.daysLeft} 天）` : `（${a.error}）`}${tpl}`);
+    console.log(C.yellow(`[dry-run] 以下域名满足通知条件，已跳过发送：`));
+    for (const [g, items] of batches) {
+      console.log(`  ▸ 分组「${g}」（${items.length} 个域名）`);
+      for (const a of items) {
+        console.log(`    - ${a.host}${a.ok ? `（剩余 ${a.daysLeft} 天）` : `（${a.error}）`}`);
+      }
     }
     return true;
   }
 
-  // 按通知模板分组发送：同组多个域名合并为一条消息；未指定模板的走顶层 notify（默认渠道）
-  const groups = new Map();
-  for (const a of alerts) {
-    if (!groups.has(a.notifyTpl)) groups.set(a.notifyTpl, []);
-    groups.get(a.notifyTpl).push(a);
-  }
-
-  for (const [tpl, items] of groups) {
-    const notifyCfg = tpl ? cfg.templates[tpl] : cfg.notify;
-    const label = tpl ? `模板「${tpl}」` : '默认渠道';
+  // 同一分组触发的多个域名合并为一条消息；未配置渠道的分组提示后跳过
+  for (const [g, items] of batches) {
+    const notifyCfg = cfg.groups[g];
+    const label = `分组「${g}」`;
     if (!notifyCfg || !Object.keys(notifyCfg).length) {
       console.error(C.red(`✖ ${label}未配置任何渠道，${items.length} 个域名的告警未发送（${items.map((i) => i.host).join('、')}）`));
       continue;
@@ -185,11 +222,10 @@ async function processAlerts(cfg, args, state, entries, kind) {
     for (const s of sendResults) {
       console.log(s.ok ? C.green(`  ✔ ${s.channel} 发送成功`) : C.red(`  ✖ ${s.channel} 发送失败：${s.error}`));
     }
-    // 任一渠道成功即记录"今天已通知"；全部失败则不记录，下一轮会重试
+    // 任一渠道成功即记录该分组"今天已通知"；全部失败则不记录，下一轮会重试
     if (sendResults.some((s) => s.ok)) {
       for (const a of items) {
-        const e = entries.find((x) => x.host === a.host);
-        markNotified(state, e.stateKey, { reason: a.ok ? 'expire' : 'error', daysLeft: a.ok ? a.daysLeft : null });
+        markNotified(state, `${a.stateKey}|${g}`, { reason: a.ok ? 'expire' : 'error', daysLeft: a.ok ? a.daysLeft : null });
       }
     }
   }
@@ -213,7 +249,7 @@ async function runOnce(cfg, args) {
         result: r,
         threshold: d.threshold ?? cfg.threshold ?? 30,
         remark: d.remark,
-        notifyTpl: d.notify || '',
+        notifyGroups: resolveNotifyGroups(d.notify),
         stateKey: `cert:${d.host}:${d.port || 443}`,
       };
     });
@@ -231,7 +267,7 @@ async function runOnce(cfg, args) {
         result: r,
         threshold: d.threshold ?? cfg.whois.threshold ?? 30,
         remark: d.remark,
-        notifyTpl: d.notify || '',
+        notifyGroups: resolveNotifyGroups(d.notify),
         stateKey: `domain:${d.host}`,
       };
     });
@@ -254,39 +290,37 @@ if (args.test) {
   const CHANNELS = ['email', 'feishu', 'wecom', 'dingtalk'];
   const t = args.test;
 
-  // 组装测试目标：渠道名测顶层 notify，模板名测该模板全部已配渠道，all 测所有配置
+  // 组装测试目标：渠道名测 default 分组的该渠道，分组名测该分组全部已配渠道，all 测所有分组
   const configured = (nc) => CHANNELS.filter((c) => nc[c]);
   let targets;
   if (t === 'all') {
-    targets = [];
-    if (cfg.notify) targets.push({ label: '默认渠道', notifyCfg: cfg.notify, channels: configured(cfg.notify) });
-    for (const [name, nc] of Object.entries(cfg.templates || {})) {
-      targets.push({ label: `模板「${name}」`, notifyCfg: nc, channels: configured(nc) });
-    }
-    if (!targets.some((tg) => tg.channels.length)) {
-      console.error('✖ config.yml 中未配置任何通知渠道（notify / templates）');
+    targets = Object.entries(cfg.groups)
+      .map(([name, nc]) => ({ label: `分组「${name}」`, notifyCfg: nc, channels: configured(nc) }))
+      .filter((tg) => tg.channels.length);
+    if (!targets.length) {
+      console.error('✖ config.yml 中未配置任何通知渠道（groups）');
       process.exit(1);
     }
-    targets = targets.filter((tg) => tg.channels.length);
   } else if (CHANNELS.includes(t)) {
-    if (!cfg.notify) {
-      console.error(`✖ 顶层 notify 中未配置 ${t}（模板里的渠道请用 --test 模板名 测试）`);
+    const nc = cfg.groups.default;
+    if (!nc || !nc[t]) {
+      console.error(`✖ 分组「default」中未配置 ${t} 渠道（其他分组请用 --test 分组名 测试）`);
       process.exit(1);
     }
-    targets = [{ label: '默认渠道', notifyCfg: cfg.notify, channels: [t] }];
+    targets = [{ label: '分组「default」', notifyCfg: nc, channels: [t] }];
   } else {
-    const nc = cfg.templates?.[t];
+    const nc = cfg.groups[t];
     if (!nc) {
-      console.error(`✖ 未找到通知模板「${t}」`);
-      console.error(`  已定义的模板：${Object.keys(cfg.templates || {}).join('、') || '（无）'}`);
+      console.error(`✖ 未找到通知分组「${t}」`);
+      console.error(`  已定义的分组：${Object.keys(cfg.groups).join('、') || '（无）'}`);
       process.exit(1);
     }
     const chs = configured(nc);
     if (!chs.length) {
-      console.error(`✖ 模板「${t}」里没有配置任何渠道`);
+      console.error(`✖ 分组「${t}」里没有配置任何渠道`);
       process.exit(1);
     }
-    targets = [{ label: `模板「${t}」`, notifyCfg: nc, channels: chs }];
+    targets = [{ label: `分组「${t}」`, notifyCfg: nc, channels: chs }];
   }
 
   for (const tg of targets) {
